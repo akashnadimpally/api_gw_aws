@@ -18,6 +18,7 @@ locals {
         resource_path    = resource.path
         http_method      = method.http_method
         integration_type = method.integration_type
+        auth_type        = method.auth_type
         uri              = method.uri
       }
     ]
@@ -72,7 +73,11 @@ resource "aws_api_gateway_rest_api" "private" {
         Resource = "execute-api:/*/*/*"
         Condition = {
           StringNotEquals = {
-            "aws:SourceVpce" = aws_vpc_endpoint.api_gw.id
+            "aws:SourceVpce" = aws_vpc_endpoint.api_gw.id,
+            "aws:PrincipalOrgID" = var.organization_id
+          },
+          ArgNotLike = {
+            "aws:PrincipalArn" = ["arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/*"]
           }
         }
       },
@@ -80,7 +85,15 @@ resource "aws_api_gateway_rest_api" "private" {
         Effect = "Allow"
         Principal = "*"
         Action = "execute-api:Invoke"
-        Resource = "execute-api:/*/*/*"
+        Resource = "execute-api:/*/*/*",
+        Condition = {
+            StringEquals = {
+                "aws.SourceVpce" = aws_vpc_endpoint.api_gw.id
+            },
+            ArnLike = {
+                "aws:PrincipalArn" = ["arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/*"]
+            }
+        }
       }
     ]
   })
@@ -102,7 +115,17 @@ resource "aws_api_gateway_method" "method" {
   rest_api_id   = aws_api_gateway_rest_api.private.id
   resource_id   = aws_api_gateway_resource.resource[each.value.resource_path].id
   http_method   = each.value.http_method
-  authorization = "NONE"
+  
+  authorization = lookup({
+    "CUSTOM"   = "CUSTOM"
+    "COGNITO"  = "COGNITO_USER_POOLS"
+    "NONE"     = "NONE"
+  }, each.value.auth_type, "NONE")
+
+  authorizer_id = lookup({
+    "CUSTOM"   = aws_api_gateway_authorizer.custom.id
+    "COGNITO"  = aws_api_gateway_authorizer.cognito.id
+  }, each.value.auth_type, null)
 
   request_validator_id = aws_api_gateway_request_validator.main.id
   request_models       = { 
@@ -214,89 +237,13 @@ resource "aws_security_group" "vpc_endpoint" {
   }
 }
 
-resource "aws_iam_role" "lambda_exec" {
-   name = "${var.api_config.name}-lambda-exec-role-${replace(var.aws_region, "-", "")}"
-
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Action = "sts:AssumeRole"
-      Effect = "Allow"
-      Principal = {
-        Service = "lambda.amazonaws.com"
-      }
-    }]
-  })
-}
 
 
-resource "aws_iam_policy" "lambda_ec2_access" {
-  name        = "lambda-ec2-access-${var.aws_region}"
-  description = "Allows Lambda to manage EC2 network interfaces"
-  policy      = <<EOF
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": [
-        "ec2:CreateNetworkInterface",
-        "ec2:DescribeNetworkInterfaces",
-        "ec2:DeleteNetworkInterface"
-      ],
-      "Resource": "*"
-    }
-  ]
-}
-EOF
-}
-
-
-
-resource "aws_iam_role_policy_attachment" "lambda_basic" {
-  role       = aws_iam_role.lambda_exec.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
-}
-
-resource "aws_iam_role_policy_attachment" "lambda_ec2" {
-  role       = aws_iam_role.lambda_exec.name
-  policy_arn = aws_iam_policy.lambda_ec2_access.arn
-}
-
-resource "aws_iam_role_policy_attachment" "lambda_vpc" {
-  role       = aws_iam_role.lambda_exec.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
-}
-
-
-
-
-resource "aws_lambda_function" "data_processor" {
-  function_name = "data-processor"
-  runtime       = "python3.9"
-  handler       = "index.lambda_handler"
-  role          = aws_iam_role.lambda_exec.arn
-
-  filename         = "${path.module}/lambda/data-processor.zip"
-  source_code_hash = filebase64sha256("${path.module}/lambda/data-processor.zip")
-
-  vpc_config {
-    subnet_ids         = aws_subnet.private.*.id
-    security_group_ids = [aws_security_group.vpc_endpoint.id]
-  }
-
-  environment {
-    variables = {
-      ENVIRONMENT = var.api_config.stage_name
-    }
-  }
-}
-
-resource "aws_lambda_permission" "apigw" {
-  statement_id  = "AllowAPIGatewayInvoke"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.data_processor.function_name
-  principal     = "apigateway.amazonaws.com"
-
-  source_arn = "${aws_api_gateway_rest_api.private.execution_arn}/*/*"
-}
+# resource "aws_vpc_endpoint" "api_gw" {
+#   vpc_id              = aws_vpc.main.id
+#   service_name        = aws_api_gateway_rest_api.private.id
+#   vpc_endpoint_type   = "Interface"
+#   security_group_ids  = [aws_security_group.vpc_endpoint.id]
+#   subnet_ids          = aws_subnet.private.*.id
+#   private_dns_enabled = true
+# }

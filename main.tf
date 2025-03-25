@@ -27,6 +27,8 @@ module "primary_region" {
   
   aws_region        = local.config.regions[0]
 
+  organization_id = "XXXXXXXXXXXXXX"
+
   lambda_source_path = "${path.module}/modules/region-deployment/lambda/data-processor.zip"  
   api_config      = local.config
   vpc_cidr        = "10.0.0.0/16"
@@ -38,6 +40,7 @@ module "secondary_region" {
   providers = { aws = aws.secondary }
 
   aws_region        = local.config.regions[1] 
+  organization_id = "XXXXXXXXXXXXXX"
 
   lambda_source_path = "${path.module}/modules/region-deployment/lambda/data-processor.zip"  
   api_config      = local.config

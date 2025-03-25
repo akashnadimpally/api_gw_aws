@@ -89,3 +89,9 @@ variable "lambda_source_path" {
   default     = "lambda/data-processor.zip"
   description = "Path to Lambda function source code"
 }
+
+
+variable "organization_id" {
+  type = string
+  description = "ORG ID"
+}

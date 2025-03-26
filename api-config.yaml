@@ -8,6 +8,7 @@ resources:
     methods:
       - http_method: "GET"
         integration_type: "HTTP_PROXY"
+        auth_type: "NONE"
         uri: "http://nlb_dns_placeholder/data"
         request_validator: "ALL"
         throttling:
@@ -18,6 +19,7 @@ resources:
     methods:
       - http_method: "POST"
         integration_type: "AWS_PROXY"
+        auth_type: "NONE"
         uri: "arn:aws:apigateway:${region}:lambda:path/2015-03-31/functions/${lambda_arn}/invocations"
         request_model: "ProcessorRequest"
         throttling:

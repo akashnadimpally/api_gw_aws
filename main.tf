@@ -22,7 +22,7 @@ provider "aws" {
 }
 
 module "primary_region" {
-  source    = "/Users/akash/Desktop/Infra/skynet_infra/API_GATEWAY/modules/region-deployment"
+  source    = "/Users/akash/Desktop/Infra/skynet_infra/api_gw_aws/modules/region-deployment"
   providers = { aws = aws.primary }
   
   aws_region        = local.config.regions[0]
@@ -36,7 +36,7 @@ module "primary_region" {
 }
 
 module "secondary_region" {
-  source    = "/Users/akash/Desktop/Infra/skynet_infra/API_GATEWAY/modules/region-deployment"
+  source    = "/Users/akash/Desktop/Infra/skynet_infra/api_gw_aws/modules/region-deployment"
   providers = { aws = aws.secondary }
 
   aws_region        = local.config.regions[1] 

@@ -1,46 +1,41 @@
-terraform {
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
-    }
-  }
+// Configure AWS providers for each region (primary and secondary)
+provider "aws" {
+  alias  = "us_east_1"
+  region = "us-east-1"
+}
+provider "aws" {
+  alias  = "us_east_2"
+  region = "us-east-2"
 }
 
+// Load API specification from YAML file
 locals {
-  config = yamldecode(file("${path.module}/api-config.yaml"))
+  api_config = yamldecode(file("${path.module}/api-config.yaml"))
 }
 
-provider "aws" {
-  alias  = "primary"
-  region = local.config.regions[0]
+// Optional: Default stage name and regions list (could also be passed via variables)
+variable "regions" {
+  type    = list(string)
+  default = ["us-east-1", "us-east-2"]
+}
+variable "stage_name" {
+  type    = string
+  default = "prod"
 }
 
-provider "aws" {
-  alias  = "secondary"
-  region = local.config.regions[1]
-}
+// Iterate deployments for each region using the submodule
+module "api_deployments" {
+  source  = "./region-deployment"
+  for_each      = toset(var.regions)        // deploy to each region in the list
+  providers = {
+    aws = aws[each.key]                    // use the provider for this region
+  }
 
-module "primary_region" {
-  source    = "/Users/akash/Desktop/Infra/skynet_infra/API_GATEWAY/modules/region-deployment"
-  providers = { aws = aws.primary }
-  
-  aws_region        = local.config.regions[0]
-
-  lambda_source_path = "${path.module}/modules/region-deployment/lambda/data-processor.zip"  
-  api_config      = local.config
-  vpc_cidr        = "10.0.0.0/16"
-  private_subnets = ["10.0.1.0/24", "10.0.2.0/24"]
-}
-
-module "secondary_region" {
-  source    = "/Users/akash/Desktop/Infra/skynet_infra/API_GATEWAY/modules/region-deployment"
-  providers = { aws = aws.secondary }
-
-  aws_region        = local.config.regions[1] 
-
-  lambda_source_path = "${path.module}/modules/region-deployment/lambda/data-processor.zip"  
-  api_config      = local.config
-  vpc_cidr        = "10.1.0.0/16"
-  private_subnets = ["10.1.1.0/24", "10.1.2.0/24"]
+  region       = each.key
+  api_name     = local.api_config.api_name
+  stage_name   = var.stage_name
+  endpoints    = local.api_config.endpoints       // list of endpoint definitions from YAML
+  require_api_key = lookup(local.api_config, "require_api_key", false)
+  throttle_rate   = lookup(local.api_config, "throttling", {})["rate_limit"]
+  throttle_burst  = lookup(local.api_config, "throttling", {})["burst_limit"]
 }

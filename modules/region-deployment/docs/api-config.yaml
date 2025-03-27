@@ -1,0 +1,43 @@
+# File Structure:
+# .
+# ├── main.tf
+# ├── variables.tf
+# ├── outputs.tf
+# ├── api-config.yaml
+# └── modules/
+#     └── member-zone/
+#         ├── main.tf
+#         ├── variables.tf
+#         └── outputs.tf
+
+# api-config.yaml
+name: "mrap-api"
+regions: ["us-east-1", "us-east-2"]
+stage_name: "prod"
+private_api: true
+resources:
+  - path: "data"
+    methods:
+      - http_method: "GET"
+        integration_type: "HTTP_PROXY"
+        uri: "http://nlb_dns_placeholder/data"
+        request_validator: "ALL"
+        throttling:
+          rate_limit: 100
+          burst_limit: 50
+  - path: "process"
+    methods:
+      - http_method: "POST"
+        integration_type: "AWS_PROXY"
+        uri: "arn:aws:apigateway:${region}:lambda:path/2015-03-31/functions/${lambda_arn}/invocations"
+        throttling:
+          rate_limit: 200
+          burst_limit: 100
+  - path: "static"
+    methods:
+      - http_method: "GET"
+        integration_type: "S3"
+        uri: "arn:aws:apigateway:${region}:s3:path/{bucket}/{key}"
+        request_parameters:
+          "integration.request.path.bucket": "'static-content'"
+          "integration.request.path.key": "method.request.path.proxy"

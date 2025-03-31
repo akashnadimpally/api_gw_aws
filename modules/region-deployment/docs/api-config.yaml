@@ -47,7 +47,10 @@
 
 
 
-
+# API Gateway
+# ├─ /v1/data → ECS Service via NLB
+# ├─ /v3/loan/{person_id} → EKS Service via NLB
+# └─ /v2/loans/statements/credit_report/{id} → Lambda
 
 
 

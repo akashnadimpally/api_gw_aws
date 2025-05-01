@@ -160,6 +160,35 @@ locals {
   )
 
   spec_valid = length(local.errors) == 0
+
+api_paths_integration_summary = flatten([
+    for path, path_item in local.spec_raw.paths : [
+      for method, op in path_item :
+      # Skip non-operations (e.g. “parameters”) and irrelevant extensions
+      (
+        method == "parameters" ||
+        (startswith(method, "x-") && method != "x-amazon-apigateway-any-method")
+      )
+      ? []                           #  ⇢ skip
+      : [
+          # Build "<path> <VERB|ANY> -> <backend-type>"
+          format(
+            "%s %s -> %s",
+            path,
+            method == "x-amazon-apigateway-any-method" ? "ANY" : upper(method),
+            can(op["x-amazon-apigateway-integration"])
+            ? (
+                lookup(op["x-amazon-apigateway-integration"], "type", "unknown") == "aws_proxy" &&
+                can(regex("lambda:path", op["x-amazon-apigateway-integration"].uri))
+              )
+              ? "lambda"
+              : lookup(op["x-amazon-apigateway-integration"], "type", "NO-INTEGRATION")
+            : "NO-INTEGRATION"
+          )
+        ]
+    ]
+  ])
+
 }
 
 # Output flag indicating if the spec passed all validations
@@ -169,33 +198,9 @@ output "openapi_spec_valid" {
   # (Optionally, you could add an output precondition here as well if using Terraform 1.3+)
 }
 
-# Output summary of each path and method with its integration backend category
 output "api_paths_integration_summary" {
-  value = flatten([
-    for path, path_item in local.spec_raw.paths : [
-      for method, operation in path_item :
-      # Only include real operations (skip parameters keys)
-      if !(method == "parameters" || (startswith(method, "x-") && method != "x-amazon-apigateway-any-method")) :
-        "${path} ${method == "x-amazon-apigateway-any-method" ? "ANY" : upper(method)} -> ${
-          can(operation["x-amazon-apigateway-integration"]) ?
-            (
-              operation["x-amazon-apigateway-integration"].type == "aws_proxy" ?
-                (can(regex("lambda:path", operation["x-amazon-apigateway-integration"].uri)) ? "lambda" : "aws_proxy") :
-              operation["x-amazon-apigateway-integration"].type == "aws" ?
-                (can(regex("lambda:", operation["x-amazon-apigateway-integration"].uri)) ? "lambda" : "aws_service") :
-              operation["x-amazon-apigateway-integration"].type == "http_proxy" ?
-                (lower(try(operation["x-amazon-apigateway-integration"].connectionType, "")) == "vpc_link" ? "ecs" : "http_proxy") :
-              operation["x-amazon-apigateway-integration"].type == "http" ?
-                (lower(try(operation["x-amazon-apigateway-integration"].connectionType, "")) == "vpc_link" ? "ecs" : "http") :
-              operation["x-amazon-apigateway-integration"].type == "mock" ?
-                "mock" :
-              "unknown"
-            )
-          : "NO-INTEGRATION"
-        }"
-    ]
-  ])
-  description = "List of path/method -> backend integration type (e.g. lambda, ecs, http_proxy, etc.)"
+  description = "List of <path> <METHOD> -> backend-type"
+  value       = local.api_paths_integration_summary
 }
 
 # Use a null_resource with precondition to fail planning if spec is invalid

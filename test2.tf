@@ -1,130 +1,213 @@
-# Load and decode the OpenAPI specification (YAML) into a Terraform map object
-locals {
-  openapi_spec = yamldecode(file("${path.module}/openapi.yaml"))
-  paths        = try(local.openapi_spec.paths, {})  # all paths in the spec (or empty map if none)
+Thanks. I’ll now generate a fully consolidated `semantic_check.tf` file that:
+
+- Validates your OpenAPI YAML spec end-to-end.
+- Includes a `fileexists()` check to enforce presence.
+- Checks that the file is structurally and semantically valid for `aws_api_gateway_rest_api.body`.
+- Outputs validation booleans and detailed integration summaries by path/method.
+
+I'll let you know as soon as it’s ready for review.
+
+# Terraform OpenAPI Semantic Validation
+
+The following Terraform configuration (`semantic_check.tf`) performs a comprehensive validation of an OpenAPI YAML specification for AWS API Gateway. It uses `yamldecode` to parse the file and checks for required structural elements (version, info, paths, etc.), validates each API path and method integration (including support for nested and wildcard paths like `/health` or `/{proxy+}`), and categorizes integrations by backend type (e.g. Lambda, ECS via VPC Link, HTTP proxy). 
+
+All checks run at **plan time**. A `null_resource` with preconditions will **fail the plan** if any validation errors are found, listing all issues. Additionally, output values summarize the results:
+- `openapi_spec_valid` – a boolean flag indicating if the spec is structurally compatible with `aws_api_gateway_rest_api.body`.
+- `api_paths_integration_summary` – a list summarizing each path, method, and the identified integration backend type.
+
+```hcl
+terraform {
+  # Ensure we use at least Terraform 1.3+ for precondition support
+  required_version = ">= 1.3.0"
 }
 
-# Define the set of recognized HTTP method keys (including the API Gateway ANY method extension)
-locals {
-  recognized_method_keys = [
-    "get", "post", "put", "delete", "patch", "head", "options",
-    "x-amazon-apigateway-any-method"
-  ]
+variable "openapi_spec_path" {
+  description = "Path to the OpenAPI spec (YAML) file to validate"
+  type        = string
 }
 
-# Identify all path names, dynamic (proxy) paths, and methods defined for each path
 locals {
-  path_names    = sort(keys(local.paths))
-  dynamic_paths = [for p in local.path_names : p if length(regexall("\\{[^}]+\\+\\}", p)) > 0]
-  path_methods  = {
-    for path, path_def in local.paths :
-    path => [for k in keys(path_def) : k if k in local.recognized_method_keys]
-  }
-}
+  # Check if the spec file exists
+  spec_file_exists = fileexists(var.openapi_spec_path)
 
-# Check for integration defined at the path level (outside specific methods)
-locals {
-  path_level_integration_types = {
-    for path, path_def in local.paths :
-    path => try(path_def["x-amazon-apigateway-integration"].type, null)
-    if contains(keys(path_def), "x-amazon-apigateway-integration")
-  }
-}
+  # Parse the YAML file into an object (empty if file missing to allow further checks)
+  spec_raw = local.spec_file_exists ? yamldecode(file(var.openapi_spec_path)) : {}
 
-# Check each method (including x-amazon-apigateway-any-method) for an integration and record its type
-locals {
-  method_integration_types = {
-    for path, path_def in local.paths :
-    path => {
-      for method, method_def in path_def :
-      method => try(method_def["x-amazon-apigateway-integration"].type, null)
-      if method in local.recognized_method_keys
-    }
-  }
-}
+  # Determine OpenAPI/Swagger version string
+  openapi_version = can(local.spec_raw.openapi) && local.spec_raw.openapi != null ? tostring(local.spec_raw.openapi) :
+                    can(local.spec_raw.swagger) && local.spec_raw.swagger != null ? tostring(local.spec_raw.swagger) : ""
 
-# Identify any methods missing an integration (type will be null if integration is absent or missing type)
-locals {
-  missing_integrations = flatten([
-    for path, methods in local.method_integration_types :
-    [
-      for method, type in methods : "${path}:${method}"
-      if type == null
+  # Validate version: must be OpenAPI 3.0.x or Swagger 2.0 (AWS API Gateway supports these)
+  version_valid = local.openapi_version != "" && (
+                    startswith(local.openapi_version, "3.0.") ||
+                    local.openapi_version == "2.0"
+                  )
+
+  # Validate required API info fields
+  info_valid  = can(local.spec_raw.info) && local.spec_raw.info.title != null && local.spec_raw.info.version != null
+
+  # Validate that at least one path is defined
+  paths_valid = can(local.spec_raw.paths) && length(keys(local.spec_raw.paths)) > 0
+
+  # Validate usage plan definitions if present (x-amazon-apigateway-usage-plans)
+  usage_plans       = can(local.spec_raw["x-amazon-apigateway-usage-plans"]) ? local.spec_raw["x-amazon-apigateway-usage-plans"] : []
+  usage_plan_errors = flatten([
+    for up in local.usage_plans : concat(
+      up.name == null ? ["Usage plan missing name"] : [],
+      (can(up.throttle) && (up.throttle.rateLimit == null || up.throttle.burstLimit == null)) ? 
+        ["Usage plan ${lookup(up, "name", "unnamed")} has incomplete throttle settings"] : [],
+      (can(up.quota) && (up.quota.limit == null || up.quota.period == null)) ? 
+        ["Usage plan ${lookup(up, "name", "unnamed")} has incomplete quota settings"] : []
+    )
+  ])
+  usage_plans_valid = length(local.usage_plan_errors) == 0
+
+  # Validate each path and method
+  # Check for integration presence and correctness, and ensure responses are defined.
+  # Supports standard methods and the x-amazon-apigateway-any-method for wildcards.
+  operation_errors = flatten([
+    for path, path_item in local.spec_raw.paths : [
+      # Iterate over each operation in the path
+      for method, operation in path_item :
+      # Only consider actual HTTP methods and the ANY-method (skip path-level parameters or other extensions)
+      (method == "parameters" || (startswith(method, "x-") && method != "x-amazon-apigateway-any-method")) ? [] :
+      concat(
+        # 1. Check integration presence
+        (! can(operation["x-amazon-apigateway-integration"]) ? 
+          ["Path ${path} ${method == "x-amazon-apigateway-any-method" ? "ANY" : upper(method)}: missing x-amazon-apigateway-integration"] : 
+          []),
+
+        # 2. If integration exists, validate required fields and values
+        can(operation["x-amazon-apigateway-integration"]) ? concat(
+          # Allowed integration types (aws, aws_proxy, http, http_proxy, mock) ([x-amazon-apigateway-integration object - Amazon API Gateway](https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-swagger-extensions-integration.html#:~:text=The%20type%20of%20integration%20with,Valid%20values%20are))
+          (contains(["aws","aws_proxy","http","http_proxy","mock"], operation["x-amazon-apigateway-integration"].type) ? [] :
+            ["Path ${path} ${method == "x-amazon-apigateway-any-method" ? "ANY" : upper(method)}: invalid integration type '${operation["x-amazon-apigateway-integration"].type}'"]),
+          # HTTP integrations must have a URI starting with http:// or https://
+          ((operation["x-amazon-apigateway-integration"].type == "http" || operation["x-amazon-apigateway-integration"].type == "http_proxy") && 
+            (operation["x-amazon-apigateway-integration"].uri == null || ! can(regex("^https?://", operation["x-amazon-apigateway-integration"].uri)))) ?
+            ["Path ${path} ${method == "x-amazon-apigateway-any-method" ? "ANY" : upper(method)}: HTTP integration missing or invalid URI"] : [],
+          # If using VPC Link, connectionId must be provided
+          ((operation["x-amazon-apigateway-integration"].type == "http" || operation["x-amazon-apigateway-integration"].type == "http_proxy") &&
+            lower(try(operation["x-amazon-apigateway-integration"].connectionType, "")) == "vpc_link" &&
+            operation["x-amazon-apigateway-integration"].connectionId == null) ?
+            ["Path ${path} ${method == "x-amazon-apigateway-any-method" ? "ANY" : upper(method)}: VPC_LINK integration missing connectionId"] : [],
+          # AWS integrations must have an ARN URI
+          ((operation["x-amazon-apigateway-integration"].type == "aws" || operation["x-amazon-apigateway-integration"].type == "aws_proxy") &&
+            (operation["x-amazon-apigateway-integration"].uri == null || !startswith(operation["x-amazon-apigateway-integration"].uri, "arn:"))) ?
+            ["Path ${path} ${method == "x-amazon-apigateway-any-method" ? "ANY" : upper(method)}: AWS integration missing or invalid URI (must be ARN)"] : [],
+          # AWS integrations must specify an integration HTTP method
+          ((operation["x-amazon-apigateway-integration"].type == "aws" || operation["x-amazon-apigateway-integration"].type == "aws_proxy") &&
+            operation["x-amazon-apigateway-integration"].httpMethod == null) ?
+            ["Path ${path} ${method == "x-amazon-apigateway-any-method" ? "ANY" : upper(method)}: AWS integration missing httpMethod"] : [],
+          # If Lambda proxy integration, httpMethod must be POST ([x-amazon-apigateway-integration object - Amazon API Gateway](https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-swagger-extensions-integration.html#:~:text=,POST))
+          (operation["x-amazon-apigateway-integration"].type == "aws_proxy" &&
+            can(operation["x-amazon-apigateway-integration"].uri) && can(regex("lambda:path", operation["x-amazon-apigateway-integration"].uri)) &&
+            operation["x-amazon-apigateway-integration"].httpMethod != "POST") ?
+            ["Path ${path} ${method == "x-amazon-apigateway-any-method" ? "ANY" : upper(method)}: Lambda proxy integration must use HTTP POST"] : [],
+          # If Lambda integration (non-proxy), ensure credentials (IAM role) are provided to authorize API Gateway to invoke
+          (operation["x-amazon-apigateway-integration"].type == "aws" &&
+            can(operation["x-amazon-apigateway-integration"].uri) && can(regex("lambda:", operation["x-amazon-apigateway-integration"].uri)) &&
+            operation["x-amazon-apigateway-integration"].credentials == null) ?
+            ["Path ${path} ${method == "x-amazon-apigateway-any-method" ? "ANY" : upper(method)}: Lambda integration missing IAM credentials"] : [],
+          # aws_proxy should only target Lambda (URI containing 'lambda:path')
+          (operation["x-amazon-apigateway-integration"].type == "aws_proxy" &&
+            can(operation["x-amazon-apigateway-integration"].uri) && ! can(regex("lambda:path", operation["x-amazon-apigateway-integration"].uri))) ?
+            ["Path ${path} ${method == "x-amazon-apigateway-any-method" ? "ANY" : upper(method)}: aws_proxy integration must target a Lambda function"] : [],
+          # AWS service integrations (non-Lambda) should have credentials
+          (operation["x-amazon-apigateway-integration"].type == "aws" &&
+            can(operation["x-amazon-apigateway-integration"].uri) && ! can(regex("lambda:", operation["x-amazon-apigateway-integration"].uri)) &&
+            operation["x-amazon-apigateway-integration"].credentials == null) ?
+            ["Path ${path} ${method == "x-amazon-apigateway-any-method" ? "ANY" : upper(method)}: AWS service integration missing IAM credentials"] : [],
+          # AWS (non-proxy) and HTTP (non-proxy) integrations should define integration response mappings (for transforming backend responses)
+          (operation["x-amazon-apigateway-integration"].type == "aws" &&
+            (operation["x-amazon-apigateway-integration"].responses == null || length(keys(operation["x-amazon-apigateway-integration"].responses)) == 0)) ?
+            ["Path ${path} ${method == "x-amazon-apigateway-any-method" ? "ANY" : upper(method)}: AWS integration missing integration response mappings"] : [],
+          (operation["x-amazon-apigateway-integration"].type == "http" &&
+            (operation["x-amazon-apigateway-integration"].responses == null || length(keys(operation["x-amazon-apigateway-integration"].responses)) == 0)) ?
+            ["Path ${path} ${method == "x-amazon-apigateway-any-method" ? "ANY" : upper(method)}: HTTP integration missing integration response mappings"] : [],
+          # Mock integrations should not specify a URI or httpMethod
+          (operation["x-amazon-apigateway-integration"].type == "mock" &&
+            (operation["x-amazon-apigateway-integration"].uri != null || operation["x-amazon-apigateway-integration"].httpMethod != null)) ?
+            ["Path ${path} ${method == "x-amazon-apigateway-any-method" ? "ANY" : upper(method)}: Mock integration should not define a URI or httpMethod"] : [],
+          # connectionType should only appear for HTTP/HTTP_PROXY integrations
+          (operation["x-amazon-apigateway-integration"].connectionType != null &&
+            ! contains(["http","http_proxy"], operation["x-amazon-apigateway-integration"].type)) ?
+            ["Path ${path} ${method == "x-amazon-apigateway-any-method" ? "ANY" : upper(method)}: connectionType is not applicable for integration type '${operation["x-amazon-apigateway-integration"].type}'"] : [],
+          # connectionId without proper connectionType
+          (operation["x-amazon-apigateway-integration"].connectionId != null &&
+            lower(try(operation["x-amazon-apigateway-integration"].connectionType, "")) != "vpc_link") ?
+            ["Path ${path} ${method == "x-amazon-apigateway-any-method" ? "ANY" : upper(method)}: connectionId provided without connectionType 'VPC_LINK'"] : []
+        ) : [],
+
+        # 3. Check that responses are defined for the operation
+        ((operation.responses == null || length(keys(operation.responses)) == 0) ?
+          ["Path ${path} ${method == "x-amazon-apigateway-any-method" ? "ANY" : upper(method)}: no responses defined"] :
+          [])
+      )
     ]
   ])
-  # Group missing integrations by path for more detailed info (if needed)
-  missing_integrations_by_path = {
-    for path, methods in local.method_integration_types :
-    path => [for method, type in methods : method if type == null]
-    if length([for method, type in methods : method if type == null]) > 0
+
+  # Consolidate all errors from the above checks
+  errors = concat(
+    local.spec_file_exists ? [] : ["Spec file not found at path '${var.openapi_spec_path}'"],
+    local.spec_file_exists ? concat(
+      local.version_valid ? [] : ["Unsupported OpenAPI/Swagger version '${local.openapi_version}'. Must be 3.0.x or 2.0."],
+      local.info_valid ? [] : ["Missing API info title or version"],
+      local.paths_valid ? [] : ["No paths defined in the API spec"],
+      local.usage_plan_errors,
+      local.operation_errors
+    ) : []
+  )
+
+  spec_valid = length(local.errors) == 0
+}
+
+# Output flag indicating if the spec passed all validations
+output "openapi_spec_valid" {
+  value       = local.spec_valid
+  description = "True if the OpenAPI spec file is structurally compatible with aws_api_gateway_rest_api.body"
+  # (Optionally, you could add an output precondition here as well if using Terraform 1.3+)
+}
+
+# Output summary of each path and method with its integration backend category
+output "api_paths_integration_summary" {
+  value = flatten([
+    for path, path_item in local.spec_raw.paths : [
+      for method, operation in path_item :
+      # Only include real operations (skip parameters keys)
+      if !(method == "parameters" || (startswith(method, "x-") && method != "x-amazon-apigateway-any-method")) :
+        "${path} ${method == "x-amazon-apigateway-any-method" ? "ANY" : upper(method)} -> ${
+          can(operation["x-amazon-apigateway-integration"]) ?
+            (
+              operation["x-amazon-apigateway-integration"].type == "aws_proxy" ?
+                (can(regex("lambda:path", operation["x-amazon-apigateway-integration"].uri)) ? "lambda" : "aws_proxy") :
+              operation["x-amazon-apigateway-integration"].type == "aws" ?
+                (can(regex("lambda:", operation["x-amazon-apigateway-integration"].uri)) ? "lambda" : "aws_service") :
+              operation["x-amazon-apigateway-integration"].type == "http_proxy" ?
+                (lower(try(operation["x-amazon-apigateway-integration"].connectionType, "")) == "vpc_link" ? "ecs" : "http_proxy") :
+              operation["x-amazon-apigateway-integration"].type == "http" ?
+                (lower(try(operation["x-amazon-apigateway-integration"].connectionType, "")) == "vpc_link" ? "ecs" : "http") :
+              operation["x-amazon-apigateway-integration"].type == "mock" ?
+                "mock" :
+              "unknown"
+            )
+          : "NO-INTEGRATION"
+        }"
+    ]
+  ])
+  description = "List of path/method -> backend integration type (e.g. lambda, ecs, http_proxy, etc.)"
+}
+
+# Use a null_resource with precondition to fail planning if spec is invalid
+resource "null_resource" "validate_openapi_spec" {
+  # Trigger resource each plan/apply (so preconditions are evaluated every time)
+  triggers = { always_run = timestamp() }
+
+  precondition {
+    condition     = local.spec_valid
+    error_message = "OpenAPI spec validation failed:\n- ${join("\n- ", local.errors)}"
   }
 }
+```
 
-# Detect paths with no explicit method definitions (these should handle all HTTP methods by default)
-locals {
-  paths_without_methods = [
-    for path, methods in local.path_methods : path 
-    if length(methods) == 0
-  ]
-  # Among those, find any that also lack a path-level integration (meaning the path is completely unimplemented)
-  paths_unimplemented = [
-    for path in local.paths_without_methods : path 
-    if contains(keys(local.path_level_integration_types), path) == false
-  ]
-}
-
-# Determine the backend service type/category for each integration at the method level
-locals {
-  method_backend_service = {
-    for path, methods in local.method_integration_types :
-    path => {
-      for method, type_val in methods :
-      method => (
-        (try(local.paths[path][method]["x-amazon-apigateway-integration"].connectionType, "") == "VPC_LINK") ? "VPC_LINK" :
-        (lower(type_val) == "aws_proxy" ? "lambda" :
-         lower(type_val) == "aws" ? (
-           contains(try(local.paths[path][method]["x-amazon-apigateway-integration"].uri, ""), ":lambda:") ? "lambda" : "aws_service"
-         ) :
-         lower(type_val) == "http_proxy" ? "http_proxy" :
-         lower(type_val) == "http" ? "http" :
-         lower(type_val) == "mock" ? "mock" :
-         "unknown"
-        )
-      )
-      if type_val != null
-    }
-  }
-  # (The above categorizes integration types: e.g., "aws_proxy" -> "lambda", 
-  #  "aws" -> "lambda" (if URI indicates Lambda) or "aws_service", 
-  #  "http"/"http_proxy" -> "VPC_LINK" if using a VPC link, otherwise "http"/"http_proxy", 
-  #  "mock" -> "mock")
-}
-
-# Determine backend service type for any path-level integrations (if present)
-locals {
-  path_level_backend_service = {
-    for path, type_val in local.path_level_integration_types :
-    path => (
-      (try(local.paths[path]["x-amazon-apigateway-integration"].connectionType, "") == "VPC_LINK") ? "VPC_LINK" :
-      (lower(type_val) == "aws_proxy" ? "lambda" :
-       lower(type_val) == "aws" ? (
-         contains(try(local.paths[path]["x-amazon-apigateway-integration"].uri, ""), ":lambda:") ? "lambda" : "aws_service"
-       ) :
-       lower(type_val) == "http_proxy" ? "http_proxy" :
-       lower(type_val) == "http" ? "http" :
-       lower(type_val) == "mock" ? "mock" :
-       "unknown"
-      )
-    )
-  }
-}
-
-# Validation flags (booleans) that can be used in precondition checks or resource counts
-locals {
-  all_methods_have_integrations = length(local.missing_integrations) == 0    # True if every defined method has an integration
-  all_paths_implemented         = length(local.paths_unimplemented) == 0    # True if every path is implemented (has methods or a direct integration)
-}
-
-# (The above locals can be used in `precondition` blocks or conditional `count` logic to enforce the OpenAPI spec validity.
-#  For example, a precondition could assert `local.all_methods_have_integrations` and `local.all_paths_implemented` are true,
-#  using `local.missing_integrations` and `local.paths_unimplemented` for detailed error messages if needed.)
+**Usage:** Include this file in your Terraform configuration. Set `var.openapi_spec_path` to the location of your OpenAPI YAML. Run `terraform plan` – if the spec violates any rule, the plan will abort with a detailed error list. Otherwise, the outputs will confirm the spec is valid and show a summary of each path’s integration type.

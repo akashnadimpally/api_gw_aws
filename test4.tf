@@ -1,185 +1,191 @@
+###############################################################################
+#  semantic_check.tf  –  OpenAPI semantic validation (Terraform >= 1.7.4)
+###############################################################################
 terraform {
   required_version = ">= 1.7.4"
 }
 
+###############################################################################
+# 1.  Load and decode the OpenAPI YAML file
+###############################################################################
 locals {
-  # Parse the OpenAPI YAML file into a Terraform map/object
-  openapi_spec = yamldecode(file("${path.module}/specs/openapispec_apikey.yaml"))  :contentReference[oaicite:5]{index=5}
+  spec_file = "${path.module}/specs/openapispec_apikey.yaml"      # <-- adjust if needed
+  spec      = yamldecode(file(local.spec_file))                   # map(object)
 
-  # Allowed HTTP methods for operations (as lowercase, per OpenAPI spec)
-  allowed_methods = ["get", "post", "put", "delete", "patch", "head", "options"]
-  ext_any        = "x-amazon-apigateway-any-method"  # AWS extension for catch-all method
-  allowed_ops_keys = concat(local.allowed_methods, [local.ext_any])  # recognized operation keys
+  #############################################################################
+  # Convenience handles
+  #############################################################################
+  paths            = try(local.spec.paths, {})                    # map = {} if missing
+  path_names       = sort(keys(local.paths))
+  allowed_verbs    = ["get","post","put","delete","patch","head","options"]
+  ext_any          = "x-amazon-apigateway-any-method"
+  recognised_keys  = concat(local.allowed_verbs, [local.ext_any])
 
-  # Global spec-level validations
-  openapi_version       = try(local.openapi_spec["openapi"], "")                     # OpenAPI version string or "" if missing
-  openapi_version_valid = local.openapi_version != "" && startswith(local.openapi_version, "3.")  # Must start with "3."
-  paths                 = try(local.openapi_spec["paths"], {})                       # paths map (empty if none)
-  has_paths             = length(keys(local.paths)) > 0                              # At least one path defined
-  info_title_ok         = try(local.openapi_spec.info.title, "") != ""               # Info.title exists and not empty
-  info_version_ok       = try(local.openapi_spec.info.version, "") != ""             # Info.version exists and not empty
-
-  # Endpoint configuration type must be PRIVATE: check for VPC endpoint IDs in the servers configuration (AWS extension)
-  endpoint_private_valid = can(local.openapi_spec["servers"]) && length(local.openapi_spec["servers"]) > 0 && length([
-    for s in local.openapi_spec["servers"] : s
-    if can(s["x-amazon-apigateway-endpoint-configuration"]) &&
-       can(s["x-amazon-apigateway-endpoint-configuration"].vpcEndpointIds) &&
-       length(s["x-amazon-apigateway-endpoint-configuration"].vpcEndpointIds) > 0
-  ]) > 0
-
-  # Stage must be 'dev': check the first server's URL or variables for 'dev'
-  stage_dev_valid = can(local.openapi_spec["servers"]) && length(local.openapi_spec["servers"]) > 0 && (
-    ( can(local.openapi_spec.servers[0].variables) && (
-        (can(local.openapi_spec.servers[0].variables.stage)    && local.openapi_spec.servers[0].variables.stage.default == "dev") ||
-        (can(local.openapi_spec.servers[0].variables.basePath) && trim(local.openapi_spec.servers[0].variables.basePath.default, "/") == "dev")
-      )
-    ) ||
-    (can(local.openapi_spec.servers[0].url) && local.openapi_spec.servers[0].url =~ "/dev($|/)")
+  #############################################################################
+  # 2.  Spec-level validations
+  #############################################################################
+  v_openapi3  = can(local.spec.openapi) && startswith(local.spec.openapi, "3.")
+  v_has_paths = length(local.path_names) > 0
+  v_info      = (
+    can(local.spec.info.title)    && trimspace(local.spec.info.title)    != "" &&
+    can(local.spec.info.version)  && trimspace(local.spec.info.version)  != ""
   )
 
-  # === Collect validation errors ===
-
-  # 1. General spec errors (version, info, stage, endpoint config, paths)
-  general_errors = concat(
-    local.openapi_version_valid ? [] : ["OpenAPI spec must use version 3.x (found ${local.openapi_version})"],
-    local.has_paths             ? [] : ["No paths defined in OpenAPI specification"],
-    local.info_title_ok         ? [] : ["Info.title is missing or empty"],
-    local.info_version_ok       ? [] : ["Info.version is missing or empty"],
-    local.stage_dev_valid       ? [] : ["API stage must be set to 'dev'"],
-    local.endpoint_private_valid ? [] : ["Endpoint configuration type must be PRIVATE"]
+  # Stage must be “dev”
+  v_stage_dev = (
+    #  a/ via x-amazon-apigateway-stage
+    ( can(local.spec["x-amazon-apigateway-stage"]) &&
+      local.spec["x-amazon-apigateway-stage"] == "dev")
+    ||
+    #  b/ first server url contains “/dev”
+    ( can(local.spec.servers[0].url) &&
+      length(regexall("/dev(/|$)", local.spec.servers[0].url)) > 0 )
   )
 
-  # 2. Unrecognized HTTP methods (operations must use standard verbs)
-  verb_errors = flatten([
-    for path, ops in local.paths : [
-      for method, op in ops : "Unrecognized HTTP verb '${method}' in path ${path}"
-      if !(method in local.allowed_methods || method == local.ext_any || method == "parameters" || method == "summary" || method == "description" || method == "servers")
+  # Endpoint type must be PRIVATE
+  v_endpoint_private = (
+    can(local.spec["x-amazon-apigateway-endpoint-configuration"].types) &&
+    contains(local.spec["x-amazon-apigateway-endpoint-configuration"].types, "PRIVATE")
+  )
+
+  #############################################################################
+  # 3.  Per-operation checks
+  #############################################################################
+  #
+  # Build a flat list of all {path, method, op-object}
+  #
+  all_ops = flatten([
+    for p, pdef in local.paths : [
+      for m, op in pdef :
+      # keep only real operations (skip “parameters” etc.)
+      {
+        path   = p
+        method = m
+        op     = op
+      }
+      if contains(local.recognised_keys, m)
     ]
   ])
 
-  # 3. Missing operation summary
-  summary_errors = flatten([
-    for path, ops in local.paths : [
-      for method, op in ops : "Missing summary for ${method} ${path}"
-      if method in local.allowed_ops_keys && try(op.summary, "") == ""
-    ]
-  ])
+  # Missing summary
+  op_no_summary = [
+    for o in local.all_ops : "${o.method} ${o.path}"
+    if can(o.op.summary) == false || trimspace(o.op.summary) == ""
+  ]
 
-  # 4. Response code validations for each operation
-  response_2xx_errors = flatten([
-    for path, ops in local.paths : [
-      for method, op in ops : "No 2xx response defined for ${method} ${path}"
-      if method in local.allowed_ops_keys && length([
-           for code in keys(try(op.responses, {})) : code
-           if can(tonumber(code)) && tonumber(code) >= 200 && tonumber(code) < 300
-         ]) == 0
+  # HTTP verb must be recognised
+  op_bad_verb = [
+    for p, pdef in local.paths : [
+      for m, _ in pdef : "${m} ${p}"
+      if !(contains(local.recognised_keys, m) || m == "parameters")
     ]
-  ])
-  response_4xx_errors = flatten([
-    for path, ops in local.paths : [
-      for method, op in ops : "No 4xx response defined for ${method} ${path}"
-      if method in local.allowed_ops_keys && length([
-           for code in keys(try(op.responses, {})) : code
-           if can(tonumber(code)) && tonumber(code) >= 400 && tonumber(code) < 500
-         ]) == 0
-    ]
-  ])
-  response_5xx_errors = flatten([
-    for path, ops in local.paths : [
-      for method, op in ops : "No 5xx response defined for ${method} ${path}"
-      if method in local.allowed_ops_keys && length([
-           for code in keys(try(op.responses, {})) : code
-           if can(tonumber(code)) && tonumber(code) >= 500 && tonumber(code) < 600
-         ]) == 0
-    ]
-  ])
+  ] |> flatten()
 
-  # 5. API integration check: every operation must have a valid x-amazon-apigateway-integration
-  integration_missing_errors = flatten([
-    for path, ops in local.paths : [
-      for method, op in ops : "No integration defined for ${method} ${path}"
-      if method in local.allowed_ops_keys && try(op["x-amazon-apigateway-integration"], null) == null
-    ]
-  ])
-  integration_type_errors = flatten([
-    for path, ops in local.paths : [
-      for method, op in ops : "Unrecognized integration type '${try(op["x-amazon-apigateway-integration"].type, "unknown")}' for ${method} ${path}"
-      if method in local.allowed_ops_keys &&
-         try(op["x-amazon-apigateway-integration"], null) != null &&
-         !contains(["AWS", "AWS_PROXY", "HTTP", "HTTP_PROXY", "MOCK"], try(op["x-amazon-apigateway-integration"].type, ""))
-    ]
-  ])
+  # 2xx / 4xx / 5xx response presence
+  op_no_2xx = [
+    for o in local.all_ops : "${o.method} ${o.path}"
+    if length([for c in keys(try(o.op.responses, {})) :
+               c if can(tonumber(c)) && tonumber(c) >=200 && tonumber(c) <300]) == 0
+  ]
+  op_no_4xx = [
+    for o in local.all_ops : "${o.method} ${o.path}"
+    if length([for c in keys(try(o.op.responses, {})) :
+               c if can(tonumber(c)) && tonumber(c) >=400 && tonumber(c) <500]) == 0
+  ]
+  op_no_5xx = [
+    for o in local.all_ops : "${o.method} ${o.path}"
+    if length([for c in keys(try(o.op.responses, {})) :
+               c if can(tonumber(c)) && tonumber(c) >=500 && tonumber(c) <600]) == 0
+  ]
 
-  # 6. Usage plan validations (throttle and quota fields)
-  usage_plans_raw  = try(local.openapi_spec["x-amazon-apigateway-usage-plans"], [])
-  usage_plans_list = local.usage_plans_raw == null ? [] :
-                     (can(keys(local.usage_plans_raw)) ? [local.usage_plans_raw] : local.usage_plans_raw)
-  usage_plan_errors = flatten([
-    for idx, up in local.usage_plans_list : concat(
-      # Ensure throttle.rateLimit and throttle.burstLimit are present
-      (!(can(up.throttle) && can(up.throttle.rateLimit) && up.throttle.rateLimit != null) ? 
-         ["Usage plan '${try(up.name, "index "+tostring(idx))}' missing rateLimit"] : []),
-      (!(can(up.throttle) && can(up.throttle.burstLimit) && up.throttle.burstLimit != null) ? 
-         ["Usage plan '${try(up.name, "index "+tostring(idx))}' missing burstLimit"] : []),
-      # Ensure quota.limit and quota.period are present
-      (!(can(up.quota) && can(up.quota.limit) && up.quota.limit != null) ? 
-         ["Usage plan '${try(up.name, "index "+tostring(idx))}' missing quota.limit"] : []),
-      (!(can(up.quota) && can(up.quota.period) && up.quota.period != null) ? 
-         ["Usage plan '${try(up.name, "index "+tostring(idx))}' missing quota.period"] : []),
-      # Ensure quota.period is one of the allowed values (MONTH, WEEK, DAY)
-      ((can(up.quota) && can(up.quota.period) && up.quota.period != null && !contains(["MONTH","WEEK","DAY"], up.quota.period)) ? 
-         ["Usage plan '${try(up.name, "index "+tostring(idx))}' has invalid quota.period '${up.quota.period}' (allowed: MONTH, WEEK, DAY)"] : [])
+  # Integration present + type valid
+  allowed_int_types = ["AWS","AWS_PROXY","HTTP","HTTP_PROXY","MOCK"]
+  op_missing_integration = [
+    for o in local.all_ops : "${o.method} ${o.path}"
+    if can(o.op["x-amazon-apigateway-integration"]) == false
+  ]
+  op_bad_int_type = [
+    for o in local.all_ops : "${o.method} ${o.path}"
+    if can(o.op["x-amazon-apigateway-integration"]) &&
+       !contains(local.allowed_int_types, upper(o.op["x-amazon-apigateway-integration"].type))
+  ]
+
+  #############################################################################
+  # 4.  Usage-plan validations (top-level extension)
+  #############################################################################
+  raw_plans = try(local.spec["x-amazon-apigateway-usage-plans"], [])
+  usage_plans = (
+    raw_plans == null ? [] :
+    # if a single map, wrap into list
+    (can(keys(raw_plans)) && type(raw_plans) == "map") ? [raw_plans] : raw_plans
+  )
+
+  plan_errors = flatten([
+    for idx, up in local.usage_plans : concat(
+      can(up.name) ? [] : ["Usage plan #${idx} missing .name"],
+      !(can(up.throttle.rateLimit))  ? ["Usage plan '${try(up.name,"#"+idx)}' missing throttle.rateLimit"] : [],
+      !(can(up.throttle.burstLimit)) ? ["Usage plan '${try(up.name,"#"+idx)}' missing throttle.burstLimit"] : [],
+      !(can(up.quota.limit))         ? ["Usage plan '${try(up.name,"#"+idx)}' missing quota.limit"]        : [],
+      !(can(up.quota.period) && contains(["MONTH","WEEK","DAY"], up.quota.period)) ?
+        ["Usage plan '${try(up.name,"#"+idx)}' quota.period invalid (use MONTH|WEEK|DAY)"] : []
     )
   ])
 
-  # Combine all error lists into one (flattened) list
-  openapi_error_list = [
-    for e in concat(
-      local.general_errors,
-      local.verb_errors,
-      local.summary_errors,
-      local.response_2xx_errors,
-      local.response_4xx_errors,
-      local.response_5xx_errors,
-      local.integration_missing_errors,
-      local.integration_type_errors,
-      local.usage_plan_errors
-    ) : e
-  ]
+  #############################################################################
+  # 5.  Aggregate **all** errors
+  #############################################################################
+  spec_errors = concat(
+    local.v_openapi3  ? [] : ["Spec is not OpenAPI 3.x"],
+    local.v_has_paths ? [] : ["Spec has no paths"],
+    local.v_info      ? [] : ["Info.title or Info.version missing"],
+    local.v_stage_dev ? [] : ["Stage must be 'dev'"],
+    local.v_endpoint_private ? [] : ["Endpoint type must be PRIVATE"],
+    [for s in local.op_bad_verb             : "Unrecognised HTTP verb: ${s}"],
+    [for s in local.op_no_summary           : "Missing summary: ${s}"],
+    [for s in local.op_no_2xx               : "No 2xx response: ${s}"],
+    [for s in local.op_no_4xx               : "No 4xx response: ${s}"],
+    [for s in local.op_no_5xx               : "No 5xx response: ${s}"],
+    [for s in local.op_missing_integration  : "No integration defined: ${s}"],
+    [for s in local.op_bad_int_type         : "Bad integration type: ${s}"],
+    local.plan_errors
+  )
 
-  # Integration summary: map each path and method to the determined backend type
+  spec_valid = length(local.spec_errors) == 0
+
+  #############################################################################
+  # 6.  Integration-backend summary (optional)
+  #############################################################################
   api_paths_integration_summary = {
-    for path, ops in local.paths : 
-      path => {
-        for method, op in ops :
-          method => (
-            can(op["x-amazon-apigateway-integration"]) ? (
-              # Determine backend type from integration details
-              (can(op["x-amazon-apigateway-integration"].connectionType) && op["x-amazon-apigateway-integration"].connectionType == "VPC_LINK") ? "vpc_link" :
-              contains(["AWS", "AWS_PROXY"], try(op["x-amazon-apigateway-integration"].type, "")) ? (
-                contains(lower(try(op["x-amazon-apigateway-integration"].uri, "")), "lambda") ? "lambda" : "aws_service"
-              ) :
-              (try(op["x-amazon-apigateway-integration"].type, "") == "HTTP_PROXY" ? "http_proxy" :
-               try(op["x-amazon-apigateway-integration"].type, "") == "HTTP"       ? "http" :
-               try(op["x-amazon-apigateway-integration"].type, "") == "MOCK"       ? "mock" : "unknown")
-            ) : "unknown"
-          )
-        if method in local.allowed_ops_keys  # include only actual operations (skip path-level keys)
-      }
+    for o in local.all_ops :
+    "${o.path} ${o.method}" =>
+      can(o.op["x-amazon-apigateway-integration"]) ?
+      upper(o.op["x-amazon-apigateway-integration"].type) : "NONE"
   }
 }
 
-# Output whether the OpenAPI spec passed all semantic checks (true if no errors)
+###############################################################################
+# 7.  Guard resource – fail plan if spec invalid
+###############################################################################
+resource "null_resource" "openapi_guard" {
+  lifecycle {
+    precondition {
+      condition     = local.spec_valid
+      error_message = "OpenAPI semantic validation failed:\n${join("\n", local.spec_errors)}"
+    }
+  }
+}
+
+###############################################################################
+# 8.  Outputs
+###############################################################################
 output "openapi_semantic_ok" {
-  value = length(local.openapi_error_list) == 0
+  value = local.spec_valid
 }
 
-# Output the list of all semantic errors found (empty if none)
 output "openapi_error_list" {
-  value = local.openapi_error_list
+  value = local.spec_errors
 }
 
-# Output a summary of each path/method mapped to its integration backend type
 output "api_paths_integration_summary" {
   value = local.api_paths_integration_summary
 }

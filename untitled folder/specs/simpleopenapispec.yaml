@@ -1,0 +1,192 @@
+#####################################################################
+#  simple‑openapi.yaml  (OpenAPI 3.0.1 — valid for PutRestApi)
+#####################################################################
+openapi: 3.0.1
+info:
+  title: Simple Lambda + S3 Demo API
+  description: >
+    Demo API that echoes requests (Lambda) and serves a tiny static web site
+    (S3).  Shows endpoint‑config, stage, request‑validators, usage‑plans,
+    aws / aws_proxy / http_proxy integrations and *x‑amazon‑apigateway‑any‑method*.
+  version: 1.0.0
+
+##############################################################################
+# GLOBAL COMPONENTS – API‑KEY security so Lambda can see header
+##############################################################################
+components:
+  securitySchemes:
+    api_key:
+      type: apiKey
+      in: header
+      name: x-api-key
+  schemas:
+    Empty:
+      type: object
+
+security:
+  - api_key: [ ]
+
+##############################################################################
+# API GATEWAY TOP‑LEVEL EXTENSIONS
+##############################################################################
+x-amazon-apigateway-endpoint-configuration:
+  types: [PRIVATE]
+
+x-amazon-apigateway-stage: dev
+
+x-amazon-apigateway-request-validators:
+  AllParams:
+    validateRequestBody: false
+    validateRequestParameters: true
+
+##############################################################################
+# PATHS
+##############################################################################
+paths:
+
+  ################################################
+  #  /  (S3 home page)
+  ################################################
+  "/":
+    get:
+      summary: Static home page
+      responses:
+        "200":
+          description: index.html
+          content:
+            text/html:
+              schema: { type: string }
+      x-amazon-apigateway-integration:
+        type: aws
+        httpMethod: GET
+        uri: arn:aws:apigateway:us-east-1:s3:path/demo-web-bucket/index.html
+        credentials: arn:aws:iam::123456789012:role/apigw-s3-read-role
+        passthroughBehavior: when_no_match
+      x-amazon-apigateway-usage-plans:
+        - name: Basic
+          throttle: { rateLimit: 10, burstLimit: 5 }
+          quota:    { period: MONTH, limit: 1000 }
+        - name: Premium
+          throttle: { rateLimit: 50, burstLimit: 20 }
+          quota:    { period: MONTH, limit: 10000 }
+
+  ################################################
+  #  /site  (S3 directory)
+  ################################################
+  "/site":
+    get:
+      summary: Static /site folder
+      responses:
+        "200": { description: OK }
+      x-amazon-apigateway-integration:
+        type: aws
+        httpMethod: GET
+        uri: arn:aws:apigateway:us-east-1:s3:path/demo-web-bucket/index.html
+        credentials: arn:aws:iam::123456789012:role/apigw-s3-read-role
+        passthroughBehavior: when_no_match
+
+  ################################################
+  #  /echo  (any verb → Lambda demo-web-bucket-skynetalpha)
+  ################################################
+  "/echo":
+    x-amazon-apigateway-any-method:
+      summary: Echo request via Lambda
+      security: [ { api_key: [] } ]
+      responses:
+        default:
+          description: Echo JSON
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Empty' }
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        credentials: arn:aws:iam::123456789012:role/apigw-s3-read-role
+        uri: arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:123456789012:function:demo-web-bucket-skynetalpha/invocations
+        passthroughBehavior: when_no_match
+
+  ################################################
+  #  /health  (GET → Lambda)
+  ################################################
+  "/health":
+    get:
+      summary: Health probe
+      responses:
+        "200":
+          description: Alive
+          content:
+            application/json:
+              schema: { type: object }
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: POST
+        uri: arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:123456789012:function:demo-web-bucket-skynetalpha/invocations
+        passthroughBehavior: when_no_match
+
+  ################################################
+  #  /lambda/{proxy+}  (any verb passthrough to same Lambda)
+  ################################################
+  "/lambda/{proxy+}":
+    x-amazon-apigateway-any-method:
+      summary: Lambda catch‑all proxy
+      parameters:
+        - in: path
+          name: proxy
+          required: true
+          schema: { type: string }
+      security: [ { api_key: [] } ]
+      responses:
+        default: { description: Lambda proxy output }
+      x-amazon-apigateway-integration:
+        type: aws_proxy
+        httpMethod: ANY
+        credentials: arn:aws:iam::123456789012:role/apigw-s3-read-role
+        uri: arn:aws:apigateway:us-east-1:lambda:path/2015-03-31/functions/arn:aws:lambda:us-east-1:123456789012:function:demo-web-bucket-skynetalpha/invocations
+        requestParameters:
+          integration.request.path.proxy: method.request.path.proxy
+        passthroughBehavior: when_no_match
+
+  # ################################################
+  # #  /vpc/{proxy+}  — HTTP_PROXY via VPC Link
+  # ################################################
+  # "/vpc/{proxy+}":
+  #   x-amazon-apigateway-any-method:
+  #     summary: Internal HTTP service over VPC Link
+  #     parameters:
+  #       - in: path
+  #         name: proxy
+  #         required: true
+  #         schema: { type: string }
+  #     responses:
+  #       default: { description: Upstream response }
+  #     x-amazon-apigateway-integration:
+  #       type: http_proxy
+  #       connectionType: VPC_LINK
+  #       connectionId: vpcl-123abc   # change to real VPC Link ID
+  #       httpMethod: ANY
+  #       uri: http://internal-service.demo.local/{proxy}
+  #       requestParameters:
+  #         integration.request.path.proxy: method.request.path.proxy
+  #       passthroughBehavior: when_no_match
+
+  ################################################
+  #  /{path+}  — default S3 catch‑all
+  ################################################
+  "/{path+}":
+    x-amazon-apigateway-any-method:
+      summary: Catch‑all static content
+      parameters:
+        - in: path
+          name: path
+          required: true
+          schema: { type: string }
+      responses:
+        default: { description: S3 object }
+      x-amazon-apigateway-integration:
+        type: aws
+        httpMethod: GET
+        credentials: arn:aws:iam::123456789012:role/apigw-s3-read-role
+        uri: arn:aws:apigateway:us-east-1:s3:path/demo-web-bucket-skynetalpha/{path}
+        requestParameters:
+          integration.request.path.path: method.request.path.path
+        passthroughBehavior: when_no_match

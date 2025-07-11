@@ -1,0 +1,7 @@
+requests
+fastapi
+pydantic
+typing-extensions
+mysql-connector-python
+uvicorn
+mangum

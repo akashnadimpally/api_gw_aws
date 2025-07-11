@@ -3,6 +3,27 @@ info:
   title: Stateless FastAPI Example
   version: "1.0"
 paths:
+  /:
+    get:
+      summary: Serve index.html from S3
+      responses:
+        '200':
+          description: HTML page
+          content:
+            text/html:
+              schema:
+                type: string
+      x-amazon-apigateway-integration:
+        type: aws
+        uri: arn:aws:apigateway:${AWS::Region}:s3:path/your-bucket-name/index.html
+        httpMethod: GET
+        credentials: arn:aws:iam::${AWS::AccountId}:role/APIGW-S3-Access-Role
+        passthroughBehavior: when_no_match
+        integrationResponses:
+          - statusCode: 200
+            responseParameters:
+              method.response.header.Content-Type: "'text/html'"
+      security: []  # or apply your existing securitySchemes here
   /hello:
     get:
       summary: Greet a user

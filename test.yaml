@@ -1,0 +1,100 @@
+openapi: 3.0.1
+info:
+  title: Stateless FastAPI Example
+  version: "1.0"
+paths:
+  /hello:
+    get:
+      summary: Greet a user
+      parameters:
+        - name: name
+          in: query
+          required: false
+          schema:
+            type: string
+            default: World
+      responses:
+        '200':
+          description: Successful greeting
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+  /add:
+    get:
+      summary: Add two numbers
+      parameters:
+        - name: a
+          in: query
+          required: true
+          schema:
+            type: integer
+        - name: b
+          in: query
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Addition result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  result:
+                    type: integer
+  /reverse:
+    post:
+      summary: Reverse a string
+      parameters:
+        - name: text
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Reversed string
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reversed:
+                    type: string
+  /status:
+    get:
+      summary: Health check
+      responses:
+        '200':
+          description: Status OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+  /lambda/{path}:
+    get:
+      summary: Catch-all dynamic path
+      parameters:
+        - name: path
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Echo dynamic path
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  path:
+                    type: string
